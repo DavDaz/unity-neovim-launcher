@@ -1,0 +1,149 @@
+#!/bin/sh
+# Unity external editor launcher for a per-project Neovim server in Ghostty.
+
+set -u
+
+canonical_path() {
+  if [ -d "$1" ]; then
+    (cd -P -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+positive_integer_or_one() {
+  case ${1-} in
+    ''|*[!0-9]*) printf '1\n' ;;
+    *)
+      # Strip leading zeroes without relying on shell arithmetic overflow.
+      value=$(printf '%s' "$1" | sed 's/^0*//')
+      [ -n "$value" ] && printf '%s\n' "$value" || printf '1\n'
+      ;;
+  esac
+}
+
+shell_quote() {
+  # Quote one argument for the POSIX shell Ghostty starts for its command field.
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\"'\\\"'/g")"
+}
+
+contains_line_break() {
+  # Command substitution removes trailing newlines, so append and remove a sentinel.
+  line_feed=$(printf '\nx')
+  line_feed=${line_feed%x}
+  carriage_return=$(printf '\rx')
+  carriage_return=${carriage_return%x}
+  case $1 in
+    *"$line_feed"*|*"$carriage_return"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if contains_line_break "${1-}" || contains_line_break "${2-}"; then
+  printf 'UnityNeovimLauncher: project and file paths must not contain newline or carriage return characters\n' >&2
+  exit 2
+fi
+
+project_path=$(canonical_path "${1-}")
+file_path=$(canonical_path "${2-}")
+line=$(positive_integer_or_one "${3-}")
+column=$(positive_integer_or_one "${4-}")
+
+if [ -n "${UNITY_NVIM_LAUNCHER_NVIM:-}" ] && [ -x "$UNITY_NVIM_LAUNCHER_NVIM" ]; then
+  nvim=$UNITY_NVIM_LAUNCHER_NVIM
+elif [ -x /opt/homebrew/bin/nvim ]; then
+  nvim=/opt/homebrew/bin/nvim
+elif nvim_path=$(command -v nvim 2>/dev/null); then
+  nvim=$nvim_path
+elif [ -x /usr/local/bin/nvim ]; then
+  nvim=/usr/local/bin/nvim
+else
+  nvim=nvim
+fi
+
+# Darwin UNIX-domain socket paths have a small fixed limit. A 128-bit prefix is
+# stable per canonical project path while keeping the complete path well below it.
+project_hash=$(printf '%s' "$project_path" | shasum -a 256 | awk '{print substr($1, 1, 32)}')
+socket="/tmp/unl-${project_hash}.sock"
+
+# Ghostty's command field receives an explicit shell invocation, not shell syntax.
+inner_command="exec $(shell_quote "$nvim") --listen $(shell_quote "$socket") $(shell_quote "+call cursor(${line}, ${column})") $(shell_quote "$file_path")"
+launch_command="/bin/sh -lc $(shell_quote "$inner_command")"
+osascript_bin=${UNITY_NVIM_LAUNCHER_OSASCRIPT:-osascript}
+
+wait_for_server() {
+  attempts=0
+  while ! "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 20 ]; then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+open_and_position() {
+  "$nvim" --server "$socket" --remote "$file_path" >/dev/null 2>&1 || return 1
+  "$nvim" --server "$socket" --remote-expr "luaeval(\"vim.api.nvim_win_set_cursor(0, {${line}, ${column} - 1})\")" >/dev/null 2>&1
+}
+
+if [ "${UNITY_NVIM_LAUNCHER_DRY_RUN:-0}" = 1 ]; then
+  printf 'project=%s\nfile=%s\nline=%s\ncolumn=%s\nnvim=%s\nsocket=%s\ncommand=%s\n' \
+    "$project_path" "$file_path" "$line" "$column" "$nvim" "$socket" "$launch_command"
+  exit 0
+fi
+
+# Probe first. A reachable server that rejects either operation must not be
+# mistaken for an absent server, otherwise a second instance could claim its socket.
+if "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; then
+  if ! open_and_position; then
+    printf 'UnityNeovimLauncher: reachable Neovim server could not open file or position cursor\n' >&2
+    exit 1
+  fi
+
+  # argv keeps the project path out of AppleScript source code.
+  "$osascript_bin" - "$project_path" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set projectPath to item 1 of argv
+  tell application "Ghostty"
+    repeat with aWindow in windows
+      repeat with aTab in tabs of aWindow
+        repeat with aTerminal in terminals of aTab
+          try
+            if (working directory of aTerminal as text) is projectPath then
+              focus aTerminal
+              return
+            end if
+          end try
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+  exit 0
+fi
+
+# Ghostty 1.3+ exposes a direct command field; do not inject text into a terminal.
+"$osascript_bin" - "$project_path" "$launch_command" <<'APPLESCRIPT'
+on run argv
+  set projectPath to item 1 of argv
+  set launchCommand to item 2 of argv
+  tell application "Ghostty"
+    set surfaceConfig to new surface configuration
+    set initial working directory of surfaceConfig to projectPath
+    set command of surfaceConfig to launchCommand
+    set newWindow to new window with configuration surfaceConfig
+    activate window newWindow
+  end tell
+end run
+APPLESCRIPT
+
+if ! wait_for_server; then
+  printf 'UnityNeovimLauncher: timed out waiting for Neovim server after Ghostty launch\n' >&2
+  exit 1
+fi
+if ! open_and_position; then
+  printf 'UnityNeovimLauncher: Neovim server started but could not open file or position cursor\n' >&2
+  exit 1
+fi
