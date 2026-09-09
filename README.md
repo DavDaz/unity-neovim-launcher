@@ -129,12 +129,9 @@ Unity's editor selection is a machine-level preference. Copying a Unity project 
 
 ## C# completion and diagnostics
 
-This launcher only handles opening and navigation. IDE features require a separate C# setup:
+This launcher only handles opening and navigation. It does not contain machine-specific Neovim configuration, language servers, or generated Unity project files.
 
-- Generated Unity `.sln` and `.csproj` files
-- A C# language server such as Roslyn
-- Neovim LSP configuration
-- Optionally, a Unity-compatible debug adapter
+For the portable OmniSharp, .NET 8, Mason, Treesitter, and Unity project-file setup, see [Neovim Unity C# LSP setup](NEOVIM-UNITY-LSP.md).
 
 If completion becomes stale after adding or moving scripts, regenerate Unity's project files before debugging the Neovim LSP configuration.
 
