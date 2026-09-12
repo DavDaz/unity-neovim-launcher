@@ -6,6 +6,14 @@ set -u
 canonical_path() {
   if [ -d "$1" ]; then
     (cd -P -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+  elif [ -e "$1" ]; then
+    path_directory=$(dirname -- "$1")
+    path_basename=$(basename -- "$1")
+    canonical_directory=$(cd -P -- "$path_directory" 2>/dev/null && pwd -P) || {
+      printf '%s\n' "$1"
+      return
+    }
+    printf '%s/%s\n' "$canonical_directory" "$path_basename"
   else
     printf '%s\n' "$1"
   fi
@@ -63,7 +71,7 @@ fi
 
 # Darwin UNIX-domain socket paths have a small fixed limit. A 128-bit prefix is
 # stable per canonical project path while keeping the complete path well below it.
-project_hash=$(printf '%s' "$project_path" | shasum -a 256 | awk '{print substr($1, 1, 32)}')
+project_hash=$(printf '%s' "$project_path" | openssl dgst -sha256 | awk '{print substr($NF, 1, 32)}')
 socket="/tmp/unl-${project_hash}.sock"
 
 # Ghostty's command field receives an explicit shell invocation, not shell syntax.

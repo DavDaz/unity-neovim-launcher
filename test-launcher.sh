@@ -45,13 +45,20 @@ printf '%s\n' "$first_socket" | grep -Eq '^/tmp/unl-[0-9a-f]{32}\.sock$' || fail
 printf '%s\n' "$command" | grep -F -- '/bin/sh -lc ' >/dev/null || fail "Ghostty command does not invoke an explicit shell"
 
 # This integration path proves server reuse without invoking Ghostty.
-test_dir=$(mktemp -d "$root/.test-tmp.XXXXXX")
+test_dir=$(mktemp -d "${TMPDIR:-/tmp}/unity-neovim-launcher.XXXXXX")
 server_pid=''
+delayed_pid=''
 cleanup() {
+  if [ -n "$delayed_pid" ]; then
+    kill "$delayed_pid" 2>/dev/null || true
+    wait "$delayed_pid" 2>/dev/null || true
+  fi
   if [ -n "$server_pid" ]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
+  [ -z "${delayed_socket:-}" ] || rm -f "$delayed_socket"
+  [ -z "${integration_socket:-}" ] || rm -f "$integration_socket"
   rm -rf "$test_dir"
 }
 trap cleanup EXIT HUP INT TERM
@@ -64,6 +71,7 @@ carriage_return_file=$(printf '%s\r%s' "$integration_project/Assets/rejected" 'f
 rejection_message='UnityNeovimLauncher: project and file paths must not contain newline or carriage return characters'
 mkdir -p "$integration_project/Assets"
 printf 'one\ntwo\nthree\n' >"$integration_file"
+canonical_integration_file=$(CDPATH= cd -P -- "$(dirname -- "$integration_file")" && printf '%s/%s\n' "$PWD" "$(basename -- "$integration_file")")
 if newline_output=$(UNITY_NVIM_LAUNCHER_DRY_RUN=1 "$launcher" "$integration_project" "$newline_file" 3 2 2>&1); then
   fail "newline path was accepted"
 fi
@@ -84,7 +92,7 @@ stub_dry=$(UNITY_NVIM_LAUNCHER_DRY_RUN=1 UNITY_NVIM_LAUNCHER_NVIM="$stub" "$laun
 stub_command=$(printf '%s\n' "$stub_dry" | awk -F= '/^command=/{sub(/^[^=]*=/, ""); print}')
 UNITY_NVIM_LAUNCHER_TEST_ARGS="$stub_args" /bin/sh -c "$stub_command"
 expected_stub_args="$test_dir/expected-nvim-stub-args"
-printf '%s\n' --listen "$integration_socket" '+call cursor(3, 2)' "$integration_file" >"$expected_stub_args"
+printf '%s\n' --listen "$integration_socket" '+call cursor(3, 2)' "$canonical_integration_file" >"$expected_stub_args"
 cmp -s "$stub_args" "$expected_stub_args" || fail "nested Ghostty command did not preserve nvim arguments"
 
 # Simulate Ghostty returning before its shell starts Neovim, then verify the
@@ -106,6 +114,7 @@ delayed_cursor=$("$nvim" --server "$delayed_socket" --remote-expr "luaeval(\"vim
 IFS= read -r delayed_pid <"$delayed_pid_file"
 kill "$delayed_pid" 2>/dev/null || true
 wait "$delayed_pid" 2>/dev/null || true
+delayed_pid=''
 "$nvim" --clean --headless --listen "$integration_socket" >/dev/null 2>&1 &
 server_pid=$!
 
@@ -117,7 +126,7 @@ while ! "$nvim" --server "$integration_socket" --remote-expr '1' >/dev/null 2>&1
 done
 
 "$launcher" "$integration_project" "$integration_file" 3 2 || fail "launcher did not reuse headless server"
-expected_file_hash=$(printf '%s' "$integration_file" | shasum -a 256 | awk '{print $1}')
+expected_file_hash=$(printf '%s' "$canonical_integration_file" | openssl dgst -sha256 | awk '{print $NF}')
 opened_file_hashes=$("$nvim" --server "$integration_socket" --remote-expr "join(map(getbufinfo({'bufloaded': 1}), 'sha256(v:val.name)'), nr2char(10))")
 printf '%s\n' "$opened_file_hashes" | grep -Fx -- "$expected_file_hash" >/dev/null || fail "server did not open exact hostile filename"
 cursor_position=$("$nvim" --server "$integration_socket" --remote-expr "luaeval(\"vim.api.nvim_win_get_cursor(0)\")[0] . ':' . (luaeval(\"vim.api.nvim_win_get_cursor(0)\")[1] + 1)")
