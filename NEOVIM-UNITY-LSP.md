@@ -116,7 +116,24 @@ return {
 
 Restart Neovim after saving the file, then run `:Lazy sync` if LazyVim has not yet installed the declared plugins/tools.
 
-## Generate Unity project files
+## Keep Unity project files synchronized
+
+Copy the repository's Editor integration into the Unity project:
+
+```sh
+mkdir -p "/absolute/path/to/UnityProject/Assets/Editor"
+cp UnityProjectSync/Editor/UnityNeovimProjectSync.cs \
+  "/absolute/path/to/UnityProject/Assets/Editor/"
+```
+
+The integration regenerates `.sln` and `.csproj` files after Unity reloads
+scripts, including newly created MonoBehaviour scripts. It requires the Rider
+IDE package (`com.unity.ide.rider`) but does not require the Rider application.
+For manual recovery, use **Tools → Neovim → Regenerate C# Project Files**.
+
+Do not manually edit generated project files.
+
+## Generate Unity project files manually
 
 In Unity, open **Unity → Settings → External Tools**, make sure a Unity IDE integration package is installed, and use **Regenerate project files**. That control may appear only when Unity recognizes an IDE integration. If selecting the custom launcher hides it, temporarily select an installed Visual Studio, Rider, or VS Code integration, regenerate the files, then restore the launcher. Do not manually edit generated project files. This generates files such as:
 
@@ -126,7 +143,7 @@ Assembly-CSharp.csproj
 Assembly-CSharp-Editor.csproj
 ```
 
-Open Neovim from the Unity project root so OmniSharp can find the `.sln`. These files are generated from the project and Unity/editor/package state; they can contain absolute paths and differ between machines. Regenerate them after adding, moving, or changing scripts/packages rather than copying them between Macs.
+Open Neovim from the Unity project root so OmniSharp can find the `.sln`. These files are generated from the project and Unity/editor/package state; they can contain absolute paths and differ between machines. Regenerate them rather than copying them between Macs.
 
 ## Configure Unity to use the launcher
 

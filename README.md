@@ -8,6 +8,7 @@ Open Unity scripts and Console errors directly in Neovim inside Ghostty, preserv
 
 - macOS 13 or newer
 - Unity with **External Tools** preferences
+- Unity's Rider IDE package (`com.unity.ide.rider`)
 - Ghostty 1.3 or newer with AppleScript enabled
 - Neovim with client/server support (`--listen`, `--server`, and `--remote`)
 
@@ -27,6 +28,19 @@ ditto UnityNeovimLauncher.app "$HOME/Applications/UnityNeovimLauncher.app"
 codesign --force --deep --sign - "$HOME/Applications/UnityNeovimLauncher.app"
 codesign --verify --deep --strict "$HOME/Applications/UnityNeovimLauncher.app"
 ```
+
+To keep generated C# project files synchronized when scripts are created,
+moved, or deleted, copy the included Unity Editor integration into each Unity
+project:
+
+```sh
+mkdir -p "/absolute/path/to/UnityProject/Assets/Editor"
+cp UnityProjectSync/Editor/UnityNeovimProjectSync.cs \
+  "/absolute/path/to/UnityProject/Assets/Editor/"
+```
+
+Unity imports the integration and regenerates the solution after script reloads.
+It also adds **Tools → Neovim → Regenerate C# Project Files** for manual recovery.
 
 Do not install it from a Unity project's `Library` directory. Unity can delete that directory.
 
@@ -103,6 +117,9 @@ Copy or clone these files:
 UnityNeovimLauncher/
 ├── README.md
 ├── test-launcher.sh
+├── UnityProjectSync/
+│   └── Editor/
+│       └── UnityNeovimProjectSync.cs
 └── UnityNeovimLauncher.app/
     └── Contents/
         ├── Info.plist
@@ -131,9 +148,15 @@ Unity's editor selection is a machine-level preference. Copying a Unity project 
 
 This launcher only handles opening and navigation. It does not contain machine-specific Neovim configuration, language servers, or generated Unity project files.
 
+The optional `UnityProjectSync` Editor integration asks Unity's Rider IDE package
+to regenerate those generated files after script reloads. This keeps newly
+created MonoBehaviour scripts visible to OmniSharp without editing `.csproj`
+files by hand.
+
 For the portable OmniSharp, .NET 8, Mason, Treesitter, and Unity project-file setup, see [Neovim Unity C# LSP setup](NEOVIM-UNITY-LSP.md).
 
-If completion becomes stale after adding or moving scripts, regenerate Unity's project files before debugging the Neovim LSP configuration.
+If completion becomes stale after adding or moving scripts, use **Tools → Neovim
+→ Regenerate C# Project Files** before debugging the Neovim LSP configuration.
 
 ## Limitations
 
