@@ -116,7 +116,12 @@ return {
 
 Restart Neovim after saving the file, then run `:Lazy sync` if LazyVim has not yet installed the declared plugins/tools.
 
-## Keep Unity project files synchronized
+## Keep Unity project files synchronized (required, once per project)
+
+This step is **mandatory for every Unity project**, including each new project
+you create. OmniSharp is configured with `single_file_support = false`, so it
+starts only where Unity has generated `.sln`/`.csproj` files. A project without
+them opens C# files in Neovim with no diagnostics, no completion, and no hover.
 
 Copy the repository's Editor integration into the Unity project:
 
@@ -130,6 +135,28 @@ The integration regenerates `.sln` and `.csproj` files after Unity reloads
 scripts, including newly created MonoBehaviour scripts. It requires the Rider
 IDE package (`com.unity.ide.rider`) but does not require the Rider application.
 For manual recovery, use **Tools → Neovim → Regenerate C# Project Files**.
+
+### New Unity project checklist
+
+Run this once after creating a project. Four steps, no manual project-file
+editing:
+
+1. Confirm the Rider IDE package is present in `Packages/manifest.json`
+   (`"com.unity.ide.rider"`). If missing, install **Rider Editor** from
+   **Window → Package Manager → Unity Registry**.
+2. Copy `UnityNeovimProjectSync.cs` into `Assets/Editor/` as shown above.
+3. Focus the Unity window so it imports and compiles the script. Unity does not
+   import assets while it sits in the background. Compilation triggers the
+   integration, which generates `ProjectName.sln`, `Assembly-CSharp.csproj`, and
+   `Assembly-CSharp-Editor.csproj` at the project root within seconds.
+4. Verify the generated `Assembly-CSharp.csproj` lists your scripts in its
+   `<Compile Include=... />` items, then open a script from Unity and check `K`
+   and diagnostics in Neovim.
+
+From then on, newly created scripts join the project automatically when Unity
+reloads scripts. If a script is ever missing from the generated project files,
+run **Tools → Neovim → Regenerate C# Project Files** and restart the LSP in
+Neovim with `:LspRestart`.
 
 Do not manually edit generated project files.
 
@@ -186,7 +213,9 @@ Also double-click a Unity script and a Console error to verify launcher navigati
 
 ### OmniSharp does not attach
 
-- Confirm the generated `.sln` and `.csproj` files exist at the Unity project root; regenerate them in Unity if they do not.
+- Confirm the generated `.sln` and `.csproj` files exist at the Unity project root; regenerate them in Unity if they do not. A project that never generated them gives no diagnostics at all — complete the new project checklist above first.
+- C# assistance is per project: a working setup in one Unity project says nothing about another. Each project needs its own `Assets/Editor/UnityNeovimProjectSync.cs` and generated project files.
+- After copying the sync script, remember that Unity imports it only when its window regains focus.
 - Open Neovim from that root, not from an unrelated directory.
 - Check `:Mason` for OmniSharp 1.39+ and run `:checkhealth vim.lsp`.
 - In Neovim, run `:echo $DOTNET_ROOT` and `:echo $PATH`; they must include the .NET 8 paths configured above.

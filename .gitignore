@@ -16,3 +16,5 @@ Obj/
 *.swp
 *.swo
 *~
+# Local Pi runtime state
+.atl/
