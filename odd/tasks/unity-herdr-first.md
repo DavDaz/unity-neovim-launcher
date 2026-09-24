@@ -23,4 +23,6 @@ Live feedback: Unity's GUI launched the installed app into direct Ghostty even w
 
 - [x] T4 [delegated writer: multi-file write] Added `/opt/homebrew/bin/herdr` and `/usr/local/bin/herdr` discovery with explicit override precedence and PATH fallback. GUI-like PATH dry-run returns `herdr=/opt/homebrew/bin/herdr`, absent override returns `herdr=-`; writer and independent verifier report `./test-launcher.sh`, both `sh -n`, `plutil -lint`, `git diff --check` PASS, no new test leaks. Installed signed copy and verified `codesign --verify --deep --strict` plus `cmp`; prior version backed up at `~/Library/Application Support/UnityNeovimLauncher/backups/UnityNeovimLauncher-pre-gui-path-20260923-200651.app`. Installed minimal-PATH dry-run detects Homebrew Herdr. User retest remains under T3.
 
+Commit evidence: `722da90` (`feat(launcher): route Unity scripts through Herdr`).
+
 Next: implementation and user testing complete. Native review lineage `review-80df0e416bfc0341` remains open and was explicitly skipped for the user test; this is not review approval. Legacy leaked headless Neovim processes from earlier test runs remain untouched. Commit and push requested by user.
