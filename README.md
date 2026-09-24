@@ -28,7 +28,7 @@ Override with the `UNITY_NVIM_LAUNCHER_NVIM` environment variable (absolute path
 
 For every request the launcher:
 
-1. Probes the project's Neovim server socket. If a live server answers, the file is opened in that existing session through Neovim RPC — no new pane or window is created.
+1. Probes the project's Neovim server socket. If a live server answers, the file is opened in that existing session through Neovim RPC — no new pane or window is created. When the session lives in the project's verified launcher-owned Herdr workspace and Ghostty is not running, the launcher additionally launches a single Ghostty surface that attaches the Herdr TUI to the already-running server, then focuses the workspace (both steps are best-effort).
 2. Otherwise, if the `herdr` CLI is available and `herdr status --json` reports a running, compatible server, Neovim starts in the project's dedicated Herdr workspace.
 3. Otherwise, a new Ghostty window is created in the Unity project directory and Neovim starts there.
 
@@ -120,6 +120,7 @@ With a compatible Herdr server running:
 - The first request for a project creates a Herdr workspace labelled `unl-<hash>` whose working directory is the Unity project, and starts Neovim with `--listen` in the workspace's fresh root pane.
 - A later request that must start Neovim again (socket dead) reuses the launcher-owned workspace but always creates a fresh tab pane. The launcher never sends a command to a pane it did not create in that invocation.
 - While the project's Neovim server is live, every further click reuses that single session: the file is opened and the cursor is positioned over the one socket, and no new pane is created.
+- If the live session's workspace is verified against the Herdr listing but Ghostty is not running (checked with a read-only `pgrep -x ghostty` probe — the installed app bundle's lowercase process name — that sends no Apple Events), the workspace has no visible terminal. The launcher then launches one Ghostty surface whose command is `exec <herdr>` — the Herdr TUI attaching to the already-running compatible server — and afterwards asks Herdr to focus the project workspace. It never starts a second Neovim session, pane, or workspace for this, and a failure of either best-effort step is only a stderr warning: the navigation itself still succeeds.
 
 After the server is up, the launcher asks Herdr to focus the project workspace. Focus is best-effort: a failed `workspace focus` is reported as a warning, and the launcher does not guarantee that the window is raised to the macOS foreground. The file is already open and positioned at that point.
 
@@ -195,6 +196,7 @@ If completion becomes stale after adding or moving scripts, use **Tools → Neov
 ## Limitations
 
 - Herdr focus is best-effort: the launcher does not guarantee that Herdr raises the workspace window to the macOS foreground.
+- The Ghostty-running probe is a plain `pgrep -x ghostty` check; if `pgrep` is missing or fails, the launcher conservatively assumes Ghostty is running and only focuses the Herdr workspace.
 - Focusing a reused old Ghostty session is unreliable: Ghostty's AppleScript API can report an empty working directory for a terminal that is already running Neovim, so the matching terminal may not be found. The file still opens in the existing Neovim session and the cursor still moves; only the window focus can be lost. This limitation is one reason Herdr is the preferred host.
 - The launcher only ever runs a command in a pane it created during that invocation; existing panes are never reused or written to.
 - Ghostty 1.3+ is required for the fallback because the launcher uses its AppleScript surface API.
@@ -229,6 +231,8 @@ Then check:
 ### Herdr reports an error
 
 Messages such as `herdr workspace list was ambiguous`, `refusing to create a duplicate workspace`, `herdr tab create failed for workspace …`, `herdr pane run failed`, or `timed out waiting for the Neovim server in the Herdr pane` mean the launcher stopped instead of guessing. Re-running the same click retries the operation. A `workspace create` that succeeded before a `pane run` failure or timeout can leave the launcher-owned workspace behind; the next attempt reuses it, and no duplicate Neovim session is ever started and no existing pane is written to.
+
+`could not launch a Ghostty surface for the Herdr session` means the file was already opened in the live Neovim session, but the best-effort attempt to show the Herdr TUI in a new Ghostty surface failed (the `osascript` output is printed right after the warning). The navigation itself succeeded; check Ghostty's AppleScript support and the macOS Automation permission.
 
 To check the launcher's workspace state:
 

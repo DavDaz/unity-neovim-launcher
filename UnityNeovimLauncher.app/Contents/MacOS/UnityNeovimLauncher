@@ -184,6 +184,61 @@ herdr_find_launcher_workspace() {
   printf '%s\n' "$list_json" | herdr_workspace_id_for_label "$2"
 }
 
+# Read-only macOS probe: is the Ghostty app process running? The installed
+# Ghostty app bundle names its process in lowercase (ghostty), so probe that
+# exact name. Only pgrep's definitive "no process matched" (exit 1) counts as
+# not running; a missing or failing pgrep conservatively reports running so
+# the launcher never launches a duplicate surface. No Apple Events are sent
+# and no app is activated.
+# UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_PROBE is a test-only probe override; it is
+# not part of the launcher's supported configuration.
+if [ -n "${UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_PROBE:-}" ] && [ -x "$UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_PROBE" ]; then
+  probe_bin=$UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_PROBE
+else
+  probe_bin=pgrep
+fi
+
+ghostty_running() {
+  "$probe_bin" -x ghostty >/dev/null 2>&1
+  case $? in
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Best-effort: give the running Herdr session a visible terminal. Only called
+# after the file was already opened through the live Neovim socket in a
+# verified launcher-owned workspace and Ghostty was found not to be running,
+# so this never creates a second Neovim session, pane, or workspace: the new
+# surface only attaches the Herdr TUI to the already-running default server.
+# A failure is reported on stderr, but the successful navigation still exits 0.
+launch_ghostty_herdr_attach() {
+  attach_inner_command="exec $(shell_quote "$herdr_bin")"
+  attach_launch_command="/bin/sh -lc $(shell_quote "$attach_inner_command")"
+  attach_log="/tmp/unl-ghostty-attach.$$.log"
+  # argv keeps the project path and command out of the AppleScript source.
+  if ! "$osascript_bin" - "$project_path" "$attach_launch_command" >/dev/null 2>"$attach_log" <<'APPLESCRIPT'
+on run argv
+  set projectPath to item 1 of argv
+  set attachCommand to item 2 of argv
+  tell application "Ghostty"
+    set surfaceConfig to new surface configuration
+    set initial working directory of surfaceConfig to projectPath
+    set command of surfaceConfig to attachCommand
+    set newWindow to new window with configuration surfaceConfig
+    activate window newWindow
+  end tell
+end run
+APPLESCRIPT
+  then
+    printf 'UnityNeovimLauncher: could not launch a Ghostty surface for the Herdr session; the file is already open in Neovim\n' >&2
+    if [ -s "$attach_log" ]; then
+      sed 's/^/UnityNeovimLauncher: osascript output: /' "$attach_log" >&2
+    fi
+  fi
+  rm -f "$attach_log"
+}
+
 if [ "${UNITY_NVIM_LAUNCHER_DRY_RUN:-0}" = 1 ]; then
   printf 'project=%s\nfile=%s\nline=%s\ncolumn=%s\nnvim=%s\nsocket=%s\nherdr=%s\nworkspace_label=%s\ncommand=%s\n' \
     "$project_path" "$file_path" "$line" "$column" "$nvim" "$socket" "${herdr_bin:--}" "$project_label" "$launch_command"
@@ -205,6 +260,14 @@ if "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; then
        [ "$(printf '%s\n' "$live_status_json" | herdr_value server compatible)" = true ]; then
       if live_ws_id=$(herdr_find_launcher_workspace "$herdr_bin" "$project_label"); then
         if [ -n "$live_ws_id" ]; then
+          # The workspace exists and is launcher-owned. When Ghostty is not
+          # running, that workspace has no visible UI: launch one surface that
+          # attaches the Herdr TUI to the already-running server, then focus
+          # the workspace. Both steps are best-effort; the file is already
+          # open and positioned, so neither failure may become exit 1.
+          if ! ghostty_running; then
+            launch_ghostty_herdr_attach
+          fi
           if ! "$herdr_bin" workspace focus "$live_ws_id" >/dev/null 2>&1; then
             printf 'UnityNeovimLauncher: herdr workspace focus failed for workspace %s\n' "$live_ws_id" >&2
           fi

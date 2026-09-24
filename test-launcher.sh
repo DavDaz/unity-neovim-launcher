@@ -251,10 +251,71 @@ herdr_bin_choice="$herdr_stub"
 herdr_osascript_choice="$no_osascript"
 herdr_nvim_choice="$nvim"
 
+# Probe stub contract: the launcher must probe the lowercase live process
+# name (pgrep -x ghostty, matching the installed app bundle's process name),
+# so the stub records its arguments and fails loudly on anything else. The
+# exit code then models pgrep: yes -> 0 (Ghostty running), no -> 1 (not
+# running), unset -> 127 so the launcher conservatively treats the probe as
+# "Ghostty running". Tests never contact live Ghostty.
+ghostty_probe_stub="$test_dir/ghostty-probe-stub"
+cat >"$ghostty_probe_stub" <<'GHOSTTY_PROBE_STUB'
+#!/bin/sh
+case "$*" in
+  "-x ghostty") ;;
+  *)
+    printf 'pgrep stub: expected exactly "-x ghostty", got: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+if [ -n "${UNITY_NVIM_LAUNCHER_TEST_PROBE_LOG:-}" ]; then
+  printf '%s\n' "$*" >>"$UNITY_NVIM_LAUNCHER_TEST_PROBE_LOG"
+fi
+case ${UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_RUNNING:-} in
+  yes) exit 0 ;;
+  no) exit 1 ;;
+  *) exit 127 ;;
+esac
+GHOSTTY_PROBE_STUB
+chmod +x "$ghostty_probe_stub"
+
+# Attach-surface osascript stub: records argc, argv, and the full stdin (the
+# AppleScript source the launcher must provide), and can simulate a failed
+# surface launch via UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_FAIL.
+attach_osascript_stub="$test_dir/attach-osascript-stub"
+cat >"$attach_osascript_stub" <<'ATTACH_OSASCRIPT_STUB'
+#!/bin/sh
+if [ -n "${UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_LOG:-}" ]; then
+  {
+    printf 'argc=%s\n' "$#"
+    printf 'args=%s\n' "$*"
+    printf 'source-start\n'
+    cat
+    printf 'stdin-end\n'
+  } >>"$UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_LOG"
+fi
+if [ -n "${UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_FAIL:-}" ]; then
+  printf 'osascript: simulated Ghostty surface launch failure\n' >&2
+  exit 1
+fi
+exit 0
+ATTACH_OSASCRIPT_STUB
+chmod +x "$attach_osascript_stub"
+
+herdr_probe_log="$test_dir/ghostty-probe.log"
+herdr_osascript_log="$test_dir/attach-osascript.log"
+herdr_osascript_fail=''
+
 herdr_run() {
   : >"$herdr_log"
+  : >"$herdr_probe_log"
+  : >"$herdr_osascript_log"
   UNITY_NVIM_LAUNCHER_HERDR="$herdr_bin_choice" \
+  UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_PROBE="$ghostty_probe_stub" \
+  UNITY_NVIM_LAUNCHER_TEST_GHOSTTY_RUNNING="${herdr_ghostty_running:-}" \
+  UNITY_NVIM_LAUNCHER_TEST_PROBE_LOG="$herdr_probe_log" \
   UNITY_NVIM_LAUNCHER_TEST_HERDR_LOG="$herdr_log" \
+  UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_LOG="$herdr_osascript_log" \
+  UNITY_NVIM_LAUNCHER_TEST_OSASCRIPT_FAIL="${herdr_osascript_fail:-}" \
   UNITY_NVIM_LAUNCHER_TEST_PANE_RUN_FAIL="${herdr_pane_run_fail:-}" \
   UNITY_NVIM_LAUNCHER_TEST_TAB_FAIL="${herdr_tab_fail:-}" \
   UNITY_NVIM_LAUNCHER_TEST_HERDR_PIDS="$herdr_pids_file" \
@@ -373,8 +434,77 @@ cmp -s "$herdr_log" "$herdr_expected_reuse" || fail "reuse route ran Herdr mutat
 herdr_cursor_is '3:2'
 herdr_kill_tracked
 
+# 3a. Live socket, verified launcher-owned workspace, Ghostty NOT running:
+# a successful attach stub proves the route - one Ghostty surface whose
+# AppleScript source creates, configures, and activates a new surface with the
+# Herdr attach command, probed with the lowercase process name, followed by
+# the usual workspace focus. No pane run, no tab create, no workspace create,
+# and exit 0: navigation already succeeded.
+herdr_ghostty_running='no'
+herdr_osascript_choice="$attach_osascript_stub"
+"$nvim" --clean --headless --listen "$herdr_socket" >/dev/null 2>&1 &
+printf '%s\n' "$!" >>"$herdr_pids_file"
+herdr_wait_server
+if ! herdr_attach_out=$(herdr_run 2>&1); then
+  fail "Ghostty-attach reuse failed even though navigation succeeded: $herdr_attach_out"
+fi
+case "$herdr_attach_out" in *'could not launch a Ghostty surface'*) fail "Ghostty attach reported a failure that did not happen" ;; esac
+case "$herdr_attach_out" in *'osascript:'*) fail "Ghostty attach stub failed on the success case: $herdr_attach_out" ;; esac
+herdr_expected_attach="$test_dir/expected-herdr-ghostty-attach"
+printf '%s\n' 'status --json' 'workspace list' 'workspace focus WS-EXIST' >"$herdr_expected_attach"
+cmp -s "$herdr_log" "$herdr_expected_attach" || fail "Ghostty-attach case ran Herdr mutations; got: $(cat "$herdr_log")"
+grep -Fx -- '-x ghostty' "$herdr_probe_log" >/dev/null || fail "Ghostty probe did not use the lowercase process name argument; got: $(cat "$herdr_probe_log")"
+attach_log_text=$(cat "$herdr_osascript_log")
+printf '%s\n' "$attach_log_text" | grep -F 'argc=3' >/dev/null || fail "attach surface invocation did not pass three argv items; got: $attach_log_text"
+printf '%s\n' "$attach_log_text" | grep -F -- "$herdr_project_c" >/dev/null || fail "attach surface did not receive the canonical project path"
+printf '%s\n' "$attach_log_text" | grep -F -- "$herdr_stub" >/dev/null || fail "attach surface command did not run the Herdr CLI"
+printf '%s\n' "$attach_log_text" | grep -F -- '/bin/sh -lc' >/dev/null || fail "attach surface command did not use an explicit shell"
+printf '%s\n' "$attach_log_text" | grep -F 'exec' >/dev/null || fail "attach surface command did not exec the Herdr TUI"
+printf '%s\n' "$attach_log_text" | grep -F 'new surface configuration' >/dev/null || fail "attach AppleScript source lacks new surface configuration"
+printf '%s\n' "$attach_log_text" | grep -F 'initial working directory of surfaceConfig to projectPath' >/dev/null || fail "attach AppleScript source lacks the working-directory assignment"
+printf '%s\n' "$attach_log_text" | grep -F 'command of surfaceConfig to attachCommand' >/dev/null || fail "attach AppleScript source lacks the command assignment"
+printf '%s\n' "$attach_log_text" | grep -F 'new window with configuration surfaceConfig' >/dev/null || fail "attach AppleScript source lacks the new-window creation"
+printf '%s\n' "$attach_log_text" | grep -F 'activate window newWindow' >/dev/null || fail "attach AppleScript source lacks window activation"
+herdr_cursor_is '3:2'
+
+# 3b. Same state but Ghostty already running: routing must be preserved
+# exactly as before the Ghostty-attach feature - remote reuse plus focus,
+# and no osascript invocation.
+herdr_ghostty_running='yes'
+if ! herdr_keep_out=$(herdr_run 2>&1); then
+  fail "Ghostty-already-running reuse failed: $herdr_keep_out"
+fi
+case "$herdr_keep_out" in *'could not launch a Ghostty surface'*) fail "Ghostty-attach ran while Ghostty was already running" ;; esac
+case "$herdr_keep_out" in *'osascript:'*) fail "Ghostty-already-running case invoked osascript" ;; esac
+cmp -s "$herdr_log" "$herdr_expected_attach" || fail "Ghostty-already-running case changed the Herdr route; got: $(cat "$herdr_log")"
+[ -s "$herdr_osascript_log" ] && fail "Ghostty-already-running case invoked the attach osascript stub"
+herdr_cursor_is '3:2'
+herdr_kill_tracked
+herdr_ghostty_running=''
+
+# 3c. Ghostty not running and the surface launch itself fails: the warning
+# must be visible on stderr, the Herdr focus must still run, and the
+# successful navigation must still exit 0.
+herdr_ghostty_running='no'
+herdr_osascript_fail=1
+"$nvim" --clean --headless --listen "$herdr_socket" >/dev/null 2>&1 &
+printf '%s\n' "$!" >>"$herdr_pids_file"
+herdr_wait_server
+if ! herdr_attach_fail_out=$(herdr_run 2>&1); then
+  fail "failed Ghostty attach turned a successful navigation into an error: $herdr_attach_fail_out"
+fi
+printf '%s\n' "$herdr_attach_fail_out" | grep -F 'could not launch a Ghostty surface' >/dev/null || fail "failed Ghostty attach was not reported visibly"
+printf '%s\n' "$herdr_attach_fail_out" | grep -F 'simulated Ghostty surface launch failure' >/dev/null || fail "failed Ghostty attach did not capture the osascript stub output"
+cmp -s "$herdr_log" "$herdr_expected_attach" || fail "failed-attach case skipped or mutated Herdr commands; got: $(cat "$herdr_log")"
+herdr_cursor_is '3:2'
+herdr_kill_tracked
+herdr_ghostty_running=''
+herdr_osascript_fail=''
+herdr_osascript_choice="$no_osascript"
+
 # 4. Ambiguous workspace list -> visible failure, no duplicate mutations.
 : >"$herdr_pids_file"
+herdr_wait_socket_dead
 herdr_list_json='not-json-at-all'
 if herdr_amb_out=$(herdr_run 2>&1); then
   fail "ambiguous workspace list did not fail visibly"
