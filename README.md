@@ -1,6 +1,8 @@
 # Unity Neovim Launcher for Ghostty
 
-Open Unity scripts and Console errors directly in Neovim inside Ghostty, preserving the file, line, and column selected in Unity.
+Open Unity scripts and Console errors directly in Neovim inside a terminal, preserving the file, line, and column selected in Unity.
+
+When a compatible Herdr server is running, the launcher opens files in a dedicated Herdr workspace for the Unity project. When Herdr is absent, not running, or incompatible, it falls back to creating a Ghostty window directly. Either way, each canonical Unity project gets exactly one Neovim server.
 
 ## Quick setup
 
@@ -9,14 +11,26 @@ Open Unity scripts and Console errors directly in Neovim inside Ghostty, preserv
 - macOS 13 or newer
 - Unity with **External Tools** preferences
 - Unity's Rider IDE package (`com.unity.ide.rider`)
-- Ghostty 1.3 or newer with AppleScript enabled
 - Neovim with client/server support (`--listen`, `--server`, and `--remote`)
+- `/usr/bin/python3` (provided by macOS developer tools) — required for the Herdr path, which parses Herdr's JSON responses
+- Optional but preferred: the `herdr` CLI, with a compatible Herdr server already running
+- Ghostty 1.3 or newer with AppleScript enabled — used as the direct fallback when Herdr is unavailable
 
 The launcher prefers Neovim in this order:
 
 1. `/opt/homebrew/bin/nvim`
 2. `nvim` from `PATH`
 3. `/usr/local/bin/nvim`
+
+Override with the `UNITY_NVIM_LAUNCHER_NVIM` environment variable (absolute path to an executable). Herdr is discovered from `PATH` or overridden with `UNITY_NVIM_LAUNCHER_HERDR` (an explicitly set but non-executable path means "Herdr unavailable").
+
+### How the launcher chooses a host
+
+For every request the launcher:
+
+1. Probes the project's Neovim server socket. If a live server answers, the file is opened in that existing session through Neovim RPC — no new pane or window is created.
+2. Otherwise, if the `herdr` CLI is available and `herdr status --json` reports a running, compatible server, Neovim starts in the project's dedicated Herdr workspace.
+3. Otherwise, a new Ghostty window is created in the Unity project directory and Neovim starts there.
 
 ### Install
 
@@ -66,14 +80,16 @@ Set **External Script Editor Args** exactly to:
 
 Unity replaces those placeholders whenever a script or navigable Console error is opened.
 
+No per-project Unity configuration beyond this is needed for Herdr: the launcher creates and reuses the project's Herdr workspace automatically on first use.
+
 ### Verify
 
 1. Double-click a `.cs` file in Unity.
-2. Confirm Ghostty opens with Neovim at the selected file.
+2. Confirm a terminal opens with Neovim at the selected file — inside the project's Herdr workspace when Herdr is running and compatible, otherwise in a new Ghostty window.
 3. Double-click a Console error that includes a file and line.
-4. Confirm the existing Neovim session is reused and the cursor moves to the reported location.
+4. Confirm the existing Neovim session is reused (no new pane) and the cursor moves to the reported location.
 
-macOS might ask whether Unity, the launcher, or `osascript` can control Ghostty. Allow it under:
+macOS asks whether Unity, the launcher, or `osascript` can control Ghostty only when the Ghostty fallback runs. Allow it under:
 
 ```text
 System Settings → Privacy & Security → Automation
@@ -85,29 +101,47 @@ System Settings → Privacy & Security → Automation
 Unity
   └─ file + line + column
        └─ UnityNeovimLauncher.app
-            └─ Ghostty AppleScript API
+            ├─ Herdr running + compatible → dedicated per-project workspace
+            └─ otherwise → Ghostty AppleScript API
                  └─ one Neovim server per Unity project
 ```
 
-Each canonical Unity project path maps to a stable socket:
+Each canonical Unity project path maps to a stable Neovim socket and Herdr workspace label with the same hash:
 
 ```text
 /tmp/unl-<32-hex-project-hash>.sock
+unl-<32-hex-project-hash>              (Herdr workspace label)
 ```
 
-On the first request, the launcher:
+### Per-project workspace (Herdr path)
 
-1. Creates a Ghostty window in the Unity project directory.
+With a compatible Herdr server running:
+
+- The first request for a project creates a Herdr workspace labelled `unl-<hash>` whose working directory is the Unity project, and starts Neovim with `--listen` in the workspace's fresh root pane.
+- A later request that must start Neovim again (socket dead) reuses the launcher-owned workspace but always creates a fresh tab pane. The launcher never sends a command to a pane it did not create in that invocation.
+- While the project's Neovim server is live, every further click reuses that single session: the file is opened and the cursor is positioned over the one socket, and no new pane is created.
+
+After the server is up, the launcher asks Herdr to focus the project workspace. Focus is best-effort: a failed `workspace focus` is reported as a warning, and the launcher does not guarantee that the window is raised to the macOS foreground. The file is already open and positioned at that point.
+
+### Ghostty fallback
+
+When Herdr is unavailable (and the socket is dead, so no duplicate session can result):
+
+1. Creates a Ghostty window in the Unity project directory with an explicit launch command (no text is injected into an existing terminal).
 2. Starts Neovim with `--listen`.
 3. Waits up to two seconds for the server socket.
 4. Opens the requested file and positions the cursor through Neovim RPC.
 
-On later requests, it:
+### What happens when Herdr errors occur
 
-1. Detects the existing project-specific Neovim server.
-2. Opens the new file in that server.
-3. Moves the cursor to Unity's line and column.
-4. Focuses the matching Ghostty terminal when possible.
+The launcher never guesses from ambiguous state, never writes into an existing pane, and never risks a duplicate session:
+
+- The Herdr workspace listing is ambiguous (duplicate `unl-` labels, or a matching workspace without a usable id) → when the project's Neovim session is already live, the launcher reuses that session remotely, prints a warning that it is skipping Herdr focus, and exits 0. When the socket is dead and a workspace would be needed, the launcher refuses to create a duplicate workspace and exits with an error.
+- `tab create`, `workspace create`, or `pane run` fails, the response has no fresh pane id, or the Neovim server does not come up within about five seconds → the error (and Herdr's output, when captured) is reported and the launcher exits. It does not silently fall back to Ghostty, because a fallback could create a second session for the project.
+- `workspace focus` fails → a warning is printed; the file is already open and positioned, so nothing is lost.
+- Herdr is absent, not running, or reports incompatible, and the socket is dead → the launcher falls back to direct Ghostty.
+
+All launcher errors go to stderr. Unity does not show stderr, so run the executable directly from a terminal to see them (see Troubleshooting).
 
 ## Moving to another Mac
 
@@ -129,7 +163,7 @@ UnityNeovimLauncher/
 
 Then:
 
-1. Install Ghostty 1.3+ and Neovim.
+1. Install Neovim, the `herdr` CLI (optional, preferred host), and Ghostty 1.3+.
 2. Run the staging tests:
 
    ```sh
@@ -139,8 +173,8 @@ Then:
 3. Copy and sign the `.app` using the installation commands above.
 4. Select the launcher in each Unity installation's **External Tools** preferences.
 5. Enter the exact Unity argument template.
-6. Approve the macOS Automation permission if prompted.
-7. Test both a script double-click and a Console error double-click.
+6. Approve the macOS Automation permission if prompted (only needed for the Ghostty fallback).
+7. Test both a script double-click and a Console error double-click, once with Herdr running and once with it stopped.
 
 Unity's editor selection is a machine-level preference. Copying a Unity project does not automatically configure the launcher on another Mac.
 
@@ -160,11 +194,14 @@ If completion becomes stale after adding or moving scripts, use **Tools → Neov
 
 ## Limitations
 
-- Ghostty 1.3+ is required because the launcher uses its AppleScript surface API.
+- Herdr focus is best-effort: the launcher does not guarantee that Herdr raises the workspace window to the macOS foreground.
+- Focusing a reused old Ghostty session is unreliable: Ghostty's AppleScript API can report an empty working directory for a terminal that is already running Neovim, so the matching terminal may not be found. The file still opens in the existing Neovim session and the cursor still moves; only the window focus can be lost. This limitation is one reason Herdr is the preferred host.
+- The launcher only ever runs a command in a pane it created during that invocation; existing panes are never reused or written to.
+- Ghostty 1.3+ is required for the fallback because the launcher uses its AppleScript surface API.
 - Project and file paths containing newline or carriage-return characters are rejected before any terminal or RPC action.
 - Spaces, apostrophes, semicolons, dollar signs, and ordinary shell metacharacters are supported.
 - Unity messages without a source file and location cannot navigate to a specific line in any editor.
-- The launcher waits up to two seconds for a newly created Neovim server.
+- The launcher waits up to two seconds for a newly created Neovim server after a Ghostty launch, and about five seconds inside a Herdr pane.
 
 ## Troubleshooting
 
@@ -182,10 +219,24 @@ Run the executable directly to expose errors:
 
 Then check:
 
+- `herdr status --json` succeeds and reports `running` and `compatible` as `true` (or stop Herdr intentionally to use the Ghostty fallback).
+- `/usr/bin/python3` exists — without it the Herdr JSON responses cannot be parsed.
 - Ghostty is installed in `/Applications/Ghostty.app`.
 - Ghostty AppleScript support is enabled.
-- macOS Automation permission was granted.
+- macOS Automation permission was granted (Ghostty fallback only).
 - Neovim is installed in one of the supported locations.
+
+### Herdr reports an error
+
+Messages such as `herdr workspace list was ambiguous`, `refusing to create a duplicate workspace`, `herdr tab create failed for workspace …`, `herdr pane run failed`, or `timed out waiting for the Neovim server in the Herdr pane` mean the launcher stopped instead of guessing. Re-running the same click retries the operation. A `workspace create` that succeeded before a `pane run` failure or timeout can leave the launcher-owned workspace behind; the next attempt reuses it, and no duplicate Neovim session is ever started and no existing pane is written to.
+
+To check the launcher's workspace state:
+
+```sh
+herdr workspace list
+```
+
+Launcher-owned workspaces are labelled `unl-<project-hash>`. Do not create a second workspace with the same label; delete or rename the conflicting one instead.
 
 ### A new window opens for every click
 
@@ -196,7 +247,9 @@ ls /tmp/unl-*.sock
 nvim --server /tmp/unl-<project-hash>.sock --remote-expr '1'
 ```
 
-A stale socket can remain after an abnormal Neovim exit. Remove only the socket confirmed to belong to the closed project session.
+A stale socket can remain after an abnormal Neovim exit. Remove only the socket confirmed to belong to the closed project session. A dead socket makes the next click start a fresh Neovim instance (in a fresh Herdr pane or a new Ghostty window), which is why one window per click usually means a stale socket.
+
+With Herdr running and a dead project socket, an ambiguous workspace listing makes the launcher exit with an error instead of creating a duplicate workspace. When the project's Neovim session is still live, the launcher reuses it and only skips the best-effort Herdr focus.
 
 ## What to put in Git
 

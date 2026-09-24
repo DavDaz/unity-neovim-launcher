@@ -1,5 +1,6 @@
 #!/bin/sh
-# Unity external editor launcher for a per-project Neovim server in Ghostty.
+# Unity external editor launcher for a per-project Neovim server.
+# Preferred host: a running, compatible Herdr server. Direct Ghostty fallback.
 
 set -u
 
@@ -73,17 +74,42 @@ fi
 # stable per canonical project path while keeping the complete path well below it.
 project_hash=$(printf '%s' "$project_path" | openssl dgst -sha256 | awk '{print substr($NF, 1, 32)}')
 socket="/tmp/unl-${project_hash}.sock"
+# Launcher-owned Herdr workspaces are named with the same stable hash.
+project_label="unl-${project_hash}"
+file_basename=$(basename -- "$file_path")
 
 # Ghostty's command field receives an explicit shell invocation, not shell syntax.
 inner_command="exec $(shell_quote "$nvim") --listen $(shell_quote "$socket") $(shell_quote "+call cursor(${line}, ${column})") $(shell_quote "$file_path")"
 launch_command="/bin/sh -lc $(shell_quote "$inner_command")"
+
+python_bin=/usr/bin/python3
 osascript_bin=${UNITY_NVIM_LAUNCHER_OSASCRIPT:-osascript}
+
+# Herdr host resolution order: an explicit UNITY_NVIM_LAUNCHER_HERDR override
+# is authoritative (an explicitly named but non-executable binary means "Herdr
+# unavailable", used by tests; inspecting a fallback would defeat the
+# isolation contract). Without an override, prefer the Apple Silicon Homebrew
+# location, then PATH, then the Intel Homebrew location: GUI launches inherit
+# a minimal PATH where herdr would otherwise be missed.
+herdr_bin=''
+if [ -n "${UNITY_NVIM_LAUNCHER_HERDR:-}" ]; then
+  if [ -x "$UNITY_NVIM_LAUNCHER_HERDR" ]; then
+    herdr_bin=$UNITY_NVIM_LAUNCHER_HERDR
+  fi
+elif [ -x /opt/homebrew/bin/herdr ]; then
+  herdr_bin=/opt/homebrew/bin/herdr
+elif herdr_path=$(command -v herdr 2>/dev/null); then
+  herdr_bin=$herdr_path
+elif [ -x /usr/local/bin/herdr ]; then
+  herdr_bin=/usr/local/bin/herdr
+fi
 
 wait_for_server() {
   attempts=0
+  limit=${1:-20}
   while ! "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; do
     attempts=$((attempts + 1))
-    if [ "$attempts" -ge 20 ]; then
+    if [ "$attempts" -ge "$limit" ]; then
       return 1
     fi
     sleep 0.1
@@ -95,18 +121,100 @@ open_and_position() {
   "$nvim" --server "$socket" --remote-expr "luaeval(\"vim.api.nvim_win_set_cursor(0, {${line}, ${column} - 1})\")" >/dev/null 2>&1
 }
 
+# Strict bounded JSON extraction with /usr/bin/python3. Any parse failure or
+# missing key exits nonzero; the launcher never guesses from partial output.
+herdr_value() {
+  [ -x "$python_bin" ] || return 3
+  "$python_bin" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+for key in sys.argv[1:]:
+    if not isinstance(data, dict) or key not in data:
+        sys.exit(3)
+    data = data[key]
+if isinstance(data, bool):
+    print("true" if data else "false")
+elif isinstance(data, str):
+    print(data)
+elif isinstance(data, (int, float)):
+    print(data)
+else:
+    sys.exit(3)
+' "$@" 2>/dev/null
+}
+
+# Prints the launcher workspace id for a label (empty when absent).
+# Exit 0: listing parsed cleanly. Exit 1: ambiguous, caller must not mutate.
+herdr_workspace_id_for_label() {
+  [ -x "$python_bin" ] || return 3
+  "$python_bin" -c '
+import json, sys
+label = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+result = data.get("result") if isinstance(data, dict) else None
+if not isinstance(result, dict) or not isinstance(result.get("workspaces"), list):
+    sys.exit(3)
+matches = []
+for workspace in result["workspaces"]:
+    if isinstance(workspace, dict) and workspace.get("label") == label:
+        matches.append(workspace)
+# Duplicate labels or a matching object without a usable id are ambiguous:
+# guessing would risk creating a duplicate workspace.
+if len(matches) > 1:
+    sys.exit(4)
+if not matches:
+    sys.exit(0)
+workspace_id = matches[0].get("workspace_id")
+if not isinstance(workspace_id, str) or not workspace_id:
+    sys.exit(4)
+print(workspace_id)
+sys.exit(0)
+' "$@" 2>/dev/null
+}
+
+herdr_find_launcher_workspace() {
+  # $1 herdr binary, $2 label. Prints workspace id (empty when absent).
+  list_json=$("$1" workspace list 2>/dev/null) || return 1
+  printf '%s\n' "$list_json" | herdr_workspace_id_for_label "$2"
+}
+
 if [ "${UNITY_NVIM_LAUNCHER_DRY_RUN:-0}" = 1 ]; then
-  printf 'project=%s\nfile=%s\nline=%s\ncolumn=%s\nnvim=%s\nsocket=%s\ncommand=%s\n' \
-    "$project_path" "$file_path" "$line" "$column" "$nvim" "$socket" "$launch_command"
+  printf 'project=%s\nfile=%s\nline=%s\ncolumn=%s\nnvim=%s\nsocket=%s\nherdr=%s\nworkspace_label=%s\ncommand=%s\n' \
+    "$project_path" "$file_path" "$line" "$column" "$nvim" "$socket" "${herdr_bin:--}" "$project_label" "$launch_command"
   exit 0
 fi
 
-# Probe first. A reachable server that rejects either operation must not be
-# mistaken for an absent server, otherwise a second instance could claim its socket.
+# A live Neovim socket is the session identity. Probe first: a reachable server
+# that rejects either operation must not be mistaken for an absent server.
 if "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; then
   if ! open_and_position; then
     printf 'UnityNeovimLauncher: reachable Neovim server could not open file or position cursor\n' >&2
     exit 1
+  fi
+
+  # Focus the Herdr workspace only with an id verified against the server listing.
+  if [ -n "$herdr_bin" ]; then
+    if live_status_json=$("$herdr_bin" status --json 2>/dev/null) &&
+       [ "$(printf '%s\n' "$live_status_json" | herdr_value server running)" = true ] &&
+       [ "$(printf '%s\n' "$live_status_json" | herdr_value server compatible)" = true ]; then
+      if live_ws_id=$(herdr_find_launcher_workspace "$herdr_bin" "$project_label"); then
+        if [ -n "$live_ws_id" ]; then
+          if ! "$herdr_bin" workspace focus "$live_ws_id" >/dev/null 2>&1; then
+            printf 'UnityNeovimLauncher: herdr workspace focus failed for workspace %s\n' "$live_ws_id" >&2
+          fi
+          exit 0
+        fi
+      else
+        printf 'UnityNeovimLauncher: herdr workspace list was ambiguous; skipping focus\n' >&2
+        exit 0
+      fi
+    fi
   fi
 
   # argv keeps the project path out of AppleScript source code.
@@ -132,6 +240,113 @@ APPLESCRIPT
   exit 0
 fi
 
+# Herdr-first launch. Every pane id below was created by this invocation; an
+# existing pane is never written to. Ambiguous host errors fail visibly instead
+# of risking duplicate sessions.
+launch_with_herdr() {
+  if ! status_json=$("$herdr_bin" status --json 2>/dev/null); then
+    return 1
+  fi
+  herdr_running=$(printf '%s\n' "$status_json" | herdr_value server running) || return 1
+  herdr_compatible=$(printf '%s\n' "$status_json" | herdr_value server compatible) || return 1
+  [ "$herdr_running" = true ] || return 1
+  [ "$herdr_compatible" = true ] || return 1
+
+  if ! workspace_id=$(herdr_find_launcher_workspace "$herdr_bin" "$project_label"); then
+    printf 'UnityNeovimLauncher: herdr workspace list failed or was unreadable; refusing to create a duplicate workspace\n' >&2
+    exit 1
+  fi
+
+  if [ -n "$workspace_id" ]; then
+    # Reuse the launcher-owned workspace but always in a freshly created pane.
+    if ! pane_json=$("$herdr_bin" tab create --workspace "$workspace_id" --cwd "$project_path" --label "$file_basename" --no-focus 2>/dev/null); then
+      printf 'UnityNeovimLauncher: herdr tab create failed for workspace %s; refusing to reuse an occupied pane\n' "$workspace_id" >&2
+      exit 1
+    fi
+  else
+    if ! pane_json=$("$herdr_bin" workspace create --cwd "$project_path" --label "$project_label" --no-focus 2>/dev/null); then
+      printf 'UnityNeovimLauncher: herdr workspace create failed; refusing to fall back to avoid duplicate sessions\n' >&2
+      exit 1
+    fi
+    workspace_id=$(printf '%s\n' "$pane_json" | herdr_value result workspace workspace_id) || {
+      printf 'UnityNeovimLauncher: herdr workspace create response had no workspace id\n' >&2
+      exit 1
+    }
+  fi
+
+  pane_id=$(printf '%s\n' "$pane_json" | herdr_value result root_pane pane_id) || {
+    printf 'UnityNeovimLauncher: herdr response had no fresh root pane id; refusing to run in an unknown pane\n' >&2
+    exit 1
+  }
+
+  # The pane was created by this invocation; only this pane receives the command.
+  # pane run is dispatched through a wrapper that records its exit status, so a
+  # failed or erroring dispatch is detected and reported promptly instead of
+  # hiding behind the socket wait. A failure here exits: falling back to
+  # Ghostty could create a duplicate session.
+  pane_run_log="/tmp/unl-pane-run.$$.out"
+  pane_run_status="/tmp/unl-pane-run.$$.code"
+  cleanup_pane_run() {
+    rm -f "$pane_run_log" "$pane_run_status"
+  }
+  trap cleanup_pane_run EXIT HUP INT TERM
+  (
+    "$herdr_bin" pane run "$pane_id" "$nvim" --listen "$socket" "$file_path" >"$pane_run_log" 2>&1
+    pane_run_code=$?
+    # A zero exit says nothing about the socket yet; only failures signal early.
+    if [ "$pane_run_code" -ne 0 ]; then
+      printf '%s\n' "$pane_run_code" >"$pane_run_status"
+    fi
+  ) &
+  pane_pid=$!
+  server_up=0
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    if "$nvim" --server "$socket" --remote-expr '1' >/dev/null 2>&1; then
+      server_up=1
+      break
+    fi
+    if [ -f "$pane_run_status" ]; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+
+  pane_run_report() {
+    printf 'UnityNeovimLauncher: %s\n' "$1" >&2
+    if [ -s "$pane_run_log" ]; then
+      sed 's/^/UnityNeovimLauncher: herdr pane run output: /' "$pane_run_log" >&2
+    fi
+  }
+
+  if [ "$server_up" -eq 0 ]; then
+    if [ -f "$pane_run_status" ]; then
+      IFS= read -r pane_run_code <"$pane_run_status"
+      wait "$pane_pid" 2>/dev/null || true
+      pane_run_report "herdr pane run failed for pane $pane_id (exit $pane_run_code)"
+    else
+      kill "$pane_pid" 2>/dev/null || true
+      pane_run_report 'timed out waiting for the Neovim server in the Herdr pane'
+    fi
+    exit 1
+  fi
+  if ! open_and_position; then
+    printf 'UnityNeovimLauncher: Neovim server started in Herdr but could not open file or position cursor\n' >&2
+    exit 1
+  fi
+  if ! "$herdr_bin" workspace focus "$workspace_id" >/dev/null 2>&1; then
+    printf 'UnityNeovimLauncher: herdr workspace focus failed for workspace %s\n' "$workspace_id" >&2
+  fi
+  exit 0
+}
+
+if [ -n "$herdr_bin" ]; then
+  launch_with_herdr
+fi
+
+# Ghostty fallback: Herdr is absent, not running, or incompatible, and the
+# socket is dead, so no duplicate session can be created by launching here.
 # Ghostty 1.3+ exposes a direct command field; do not inject text into a terminal.
 "$osascript_bin" - "$project_path" "$launch_command" <<'APPLESCRIPT'
 on run argv
